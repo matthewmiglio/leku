@@ -15,11 +15,16 @@ Usage:
   python leku.py search "the office" --type tv
   python leku.py stream 155                 # movie embed URLs (open in browser)
   python leku.py stream 1399 -s 1 -e 1     # tv episode embed URLs
-  python leku.py download 155               # movie -> ./downloads
+  python leku.py download 155 --type movie  # movie -> ./downloads
   python leku.py download 1399 -s 1 -e 1    # single tv episode
   python leku.py download 1399 -s 1         # whole season
-  python leku.py download 1399              # every episode of the show
-  python leku.py download 155 --fragments 20  # sample: first 20 segments only
+  python leku.py download 1399 --type tv     # every episode of the show
+  python leku.py download 155 --type movie --fragments 20   # quick sample
+
+NOTE: TMDB movie and tv ids are SEPARATE namespaces and often collide
+(movie 155 = The Dark Knight, tv 155 = 3rd Rock from the Sun), so a bare
+id that exists in both needs --type movie|tv. The `search` output shows the
+type next to every id.
 
 Requires: node (wasm stream-url decryption), yt-dlp (HLS download).
 """
@@ -91,16 +96,25 @@ def _tv_season_map(tid):
             if (s.get("season_number") or 0) >= 1]
 
 
-def _is_tv(tid):
-    """True if the TMDB id is a TV show (used when no -s/-e is given)."""
+def _tmdb_kind(tid):
+    """Which TMDB namespace a bare id belongs to: 'movie', 'tv', or exits
+    with an error. Ids are separate per namespace, so e.g. movie 155 (The
+    Dark Knight) and tv 155 (3rd Rock from the Sun) both exist."""
     q = urllib.parse.urlencode({"api_key": TMDB_KEY})
-    try:
-        _get(f"{TMDB}/tv/{tid}?{q}")
-        return True
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return False
-        raise
+    found = []
+    for kind in ("movie", "tv"):
+        try:
+            _get(f"{TMDB}/{kind}/{tid}?{q}")
+            found.append(kind)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+    if not found:
+        sys.exit(f"error: tmdb id {tid} not found as a movie or tv show")
+    if len(found) == 2:
+        sys.exit(f"error: tmdb id {tid} exists as BOTH a movie and a tv show "
+                 f"(ids are per-namespace); pass --type movie or --type tv")
+    return found[0]
 
 
 def search(query, mtype="multi"):
@@ -327,6 +341,9 @@ def main():
         if name == "download":
             c.add_argument("--fragments", type=int, default=None,
                            help="download only the first N segments (sample)")
+            c.add_argument("--type", default=None, choices=["movie", "tv"],
+                           help="namespace for the id (required when it "
+                                "exists as both a movie and a show)")
     a = p.parse_args()
     if a.cmd == "search":
         search(a.query, a.type)
@@ -334,16 +351,18 @@ def main():
         stream(a.tmdb_id, a.season, a.episode)
     elif a.cmd == "download":
         if a.episode:
+            # -s and -e given: that tv episode
             sys.exit(download(a.tmdb_id, a.season, a.episode,
                               fragments=a.fragments))
         if a.season:
             # -s without -e: whole season
             sys.exit(download_all(a.tmdb_id, season=int(a.season),
                                  fragments=a.fragments))
-        if _is_tv(a.tmdb_id):
-            # no -s/-e on a show: every episode of every season
+        kind = a.type or _tmdb_kind(a.tmdb_id)
+        if kind == "tv":
+            # bare show id: every episode of every season
             sys.exit(download_all(a.tmdb_id, fragments=a.fragments))
-        # no -s/-e on a movie: the movie
+        # bare movie id: the movie
         sys.exit(download(a.tmdb_id, None, None, fragments=a.fragments))
 
 
