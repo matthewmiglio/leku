@@ -1,0 +1,115 @@
+# leku — drive lekuluent.et from the CLI
+
+A single-file CLI (`leku.py`) that drives the underlying services of
+**lekuluent.et**, an Ethiopian movie/TV streaming site — so you can search
+its catalog, get playable stream URLs, and download media, all from a terminal.
+
+The site looks like a custom app, but it's a thin Next.js frontend over two
+public services: **TMDB** for search/metadata and public **embed providers**
+for playback. `leku.py` reproduces what the site's own player does, including
+resolving the vidsrc provider chain (signed tokens, encrypted stream URLs,
+WASM decryption) end to end.
+
+## How it works
+
+```mermaid
+flowchart TD
+    subgraph CLI["python leku.py"]
+        S["search &lt;query&gt;"]
+        T["stream &lt;tmdb_id&gt;"]
+        D["download &lt;tmdb_id&gt;"]
+    end
+
+    S -->|"GET /3/search (embedded public key)"| TMDB["TMDB api.themoviedb.org"]
+    T -->|"URL templates from site JS"| EMB["Embed providers<br/>(vidsrc.sh, vidlink.pro,<br/>vidfast.vc, vidrock.to, vidsrc.si)"]
+    D --> CHAIN
+
+    subgraph CHAIN["vidsrc resolution chain (resolve_stream)"]
+        A["1. vs_src.php<br/>→ signed landing URL"]
+        B["2. landing page<br/>→ playerUrl"]
+        C["3. player page<br/>→ window.CONFIG (apiToken)"]
+        M["4. metadata API<br/>→ rotating pool host"]
+        W["5. pool/api.php?stream_urls<br/>→ encrypted stream_urls"]
+        X["6. node + provider's WASM<br/>→ playlist URLs"]
+        G["7. pool/generate.php<br/>→ JWT"]
+        P["8-9. playlist + segments<br/>(?token= + Referer)<br/>→ local m3u8 → yt-dlp"]
+        A --> B --> C --> M --> W --> X --> G --> P
+    end
+
+    P -->|HLS segments| POOL["Pool host (rotating)<br/>e.g. kettlerivercrafts.space"]
+    P -->|"downloads/&lt;title&gt;.mp4"| OUT[("MP4")]
+```
+
+**Key details of the chain** (each hop read out of the provider's own player JS):
+
+- The player page mints a **single-use, IP-bound `apiToken`**; the metadata
+  response advertises a **rotating pool host** that serves the actual streams.
+- `pool/api.php?...&stream_urls&api_token=` returns `data.stream_urls` as a
+  **base64 ChaCha20 blob** plus the URL of a **per-5-minute-window WASM
+  decryptor**. `leku.py` runs that wasm under Node (a port of the site's own
+  `vsdec.js`) to recover the playlist URLs.
+- `pool/generate.php` returns a JWT (~4 h, IP-range bound). Every playlist and
+  segment request needs **both** `?token=<jwt>` and
+  `Referer: <landing origin>` — bare requests get 403.
+- `leku.py` rewrites a token-stamped HLS playlist to a local file and hands it
+  to **yt-dlp's native HLS downloader** (which honors `--add-headers`; ffmpeg
+  section downloads silently drop the Referer and fail).
+
+## Setup
+
+Requirements:
+
+- **Python 3.10+** (stdlib only — no pip packages)
+- **Node.js 18+** on PATH (runs the WASM stream-URL decryption)
+- **yt-dlp** on PATH (HLS download; ffmpeg bundled with yt-dlp does muxing)
+
+```bash
+git clone https://github.com/<you>/leku.git
+cd leku
+python leku.py search "batman"   # smoke test — should print titles + TMDB ids
+```
+
+No config, no `.env`, no keys to supply — the TMDB API key it uses is the
+public one lekuluent.et ships in its own client JS.
+
+## Usage
+
+```
+usage: leku.py {search,stream,download} ...
+
+search:
+  python leku.py search "batman"              # multi (movies + tv)
+  python leku.py search "the office" --type tv
+
+stream (playable embed URLs — open any in a browser to watch):
+  python leku.py stream 155                   # movie by TMDB id
+  python leku.py stream 1399 -s 1 -e 1        # tv season/episode
+
+download (resolves the chain, then yt-dlp → ./downloads/<title>.mp4):
+  python leku.py download 155
+  python leku.py download 1399 -s 1 -e 1
+  python leku.py download 155 --fragments 20   # sample: first 20 segments only
+```
+
+Workflow: `search` prints `tmdb_id  type  year  title` — feed the id into
+`stream` or `download`. `--fragments N` is handy for quick tests without
+pulling a full movie.
+
+### Notes & caveats
+
+- The resolution chain is specific to the **vidsrc family** (vidsrc.sh /
+  embed.vidsrc.si funnel into the same backend); the other providers are
+  listed by `stream` as alternates.
+- yt-dlp alone cannot crack the embed pages — the resolver is the essential part.
+- Tokens are single-use and IP-bound, so `download` resolves a fresh chain
+  every run.
+- This tool drives the same public endpoints the site's own player drives,
+  for personal use. Respect copyright in what you keep.
+
+## Repo layout
+
+```
+leku.py      # everything: search / stream / download + embedded wasm decryptor
+README.md
+.gitignore   # ignores downloads/ output
+```
