@@ -126,7 +126,10 @@ def search(query, mtype="multi"):
         date = (r.get("release_date") or r.get("first_air_date") or "")[:4]
         if t == "person":
             continue
-        print(f"{r['id']:>8}  {t:<5}  {date:<4}  {name}")
+        # poster on TMDB's public image CDN (same one the site uses)
+        poster = r.get("poster_path")
+        purl = f"https://image.tmdb.org/t/p/w342{poster}" if poster else "-"
+        print(f"{r['id']:>8}  {t:<5}  {date:<4}  {name}  {purl}")
 
 
 def stream(tid, season, episode):

@@ -93,9 +93,10 @@ download (resolves the chain, then yt-dlp → ./downloads/<title>.mp4):
   python leku.py download 155 --type movie --fragments 20   # quick sample
 ```
 
-Workflow: `search` prints `tmdb_id  type  year  title` — feed the id into
-`stream` or `download`. `--fragments N` is handy for quick tests without
-pulling a full movie.
+Workflow: `search` prints `tmdb_id  type  year  title  poster_url` — feed
+the id into `stream` or `download`. The poster URL points at TMDB's public
+image CDN (open it to preview the cover art; `-` means no poster on file).
+`--fragments N` is handy for quick tests without pulling a full movie.
 
 **TMDB ids are per-namespace:** movie and tv ids are independent and
 collide constantly (movie 155 = The Dark Knight, tv 155 = 3rd Rock from
