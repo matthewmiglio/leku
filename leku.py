@@ -28,7 +28,7 @@ type next to every id.
 
 Requires: node (wasm stream-url decryption), yt-dlp (HLS download).
 """
-import argparse, json, os, pathlib, re, subprocess, sys, tempfile
+import argparse, json, os, pathlib, re, subprocess, sys, tempfile, time
 import urllib.parse, urllib.request
 
 TMDB = "https://api.themoviedb.org/3"
@@ -213,13 +213,16 @@ def resolve_stream(tid, season=None, episode=None):
         raise RuntimeError("player page has no window.CONFIG")
     cfg = json.loads(m.group(1))
     if not cfg.get("apiToken"):
-        # Gated page: provider serves "cold" (older/less popular) files behind
-        # a Cloudflare Turnstile captcha; a browser must solve it to mint a
-        # real apiToken. See HAS_GATE / refreshGateTicket() in player.js.
+        # Gated page: no apiToken until a Cloudflare Turnstile captcha is
+        # solved (in a real browser). The page states why: "over-cap" means
+        # this IP has resolved too many streams recently and is rate-limited
+        # until the cap decays or a captcha is solved. See HAS_GATE /
+        # refreshGateTicket() in the site's player.js.
+        reason = cfg.get("gateReason") or "unknown"
         raise RuntimeError(
-            "this episode is behind a Turnstile captcha gate (a 'cold' file) "
-            "-- open the embed URL in a browser to watch it, or try another "
-            "provider from `stream` output")
+            f"captcha-gated (reason: {reason}). If 'over-cap', this IP has "
+            "resolved too many streams lately -- wait a while and retry, or "
+            "open the embed URL in a browser and solve the captcha")
     api_token = cfg["apiToken"]
 
     # 4. metadata -> pool host
@@ -314,9 +317,12 @@ def download(tid, season, episode, out="downloads", fragments=None):
     return rc
 
 
-def download_all(tid, season=None, out="downloads", fragments=None):
+def download_all(tid, season=None, out="downloads", fragments=None,
+                delay=2.0):
     """Download every episode of a show, or of one season. Each episode
-    resolves its own fresh provider chain (tokens are single-use)."""
+    resolves its own fresh provider chain (tokens are single-use); a small
+    pause between episodes keeps the provider's per-IP resolution cap happy
+    (exceeding it serves captcha-gated pages -- gateReason 'over-cap')."""
     rc = 0
     for s, n in _tv_season_map(tid):
         if season is not None and s != season:
@@ -331,6 +337,8 @@ def download_all(tid, season=None, out="downloads", fragments=None):
                 rc = 1
                 print(f"S{s:02d}E{e:02d} failed ({ex}); continuing",
                       file=sys.stderr)
+            if delay and e < n:
+                time.sleep(delay)
     return rc
 
 
