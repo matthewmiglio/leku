@@ -186,6 +186,20 @@ def _fetch(url, referer, as_json=False):
 
 def _decrypt_stream_urls(streams_json):
     """Run the embedded wasm decryptor under node; JSON in, URL list out."""
+    d = (streams_json or {}).get("data")
+    if not d or not d.get("stream_urls"):
+        # Error envelope (seen after rapid back-to-back resolutions: the API
+        # answers without data). Don't feed it to the node decryptor.
+        code = (streams_json or {}).get("status_code") \
+            or (streams_json or {}).get("error") or "no data"
+        if str(code) == "404":
+            raise RuntimeError(
+                "the provider doesn't have this title (status 404) -- it "
+                "may not be in their library yet, or not at this id")
+        raise RuntimeError(
+            f"stream API returned an error envelope ({code}) -- likely "
+            "provider rate limiting; wait a bit and re-run (partial "
+            "downloads resume automatically)")
     fd, path = tempfile.mkstemp(suffix=".mjs", prefix="leku_vsdec_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -327,6 +341,10 @@ def download(tid, season, episode, out="downloads", fragments=None):
         "yt-dlp", "--no-warnings", "--enable-file-urls", "-N", "4",
         "--user-agent", UA,
         "--add-headers", f"Referer: {origin}/",
+        # the pool hosts 429 under sustained fragment traffic; a short pause
+        # between requests plus generous fragment retries rides it out
+        "--sleep-requests", "0.25",
+        "--fragment-retries", "15",
         "-o", os.path.join(out, f"{safe}.%(ext)s"),
         local.as_uri(),
     ])
@@ -411,6 +429,11 @@ def main():
             sys.exit(download(a.tmdb_id, None, None, fragments=a.fragments))
         except GatedError as ex:
             _gate_help(ex)
+            sys.exit(1)
+        except RuntimeError as ex:
+            # resolution-chain failures (gates, API error envelopes): clean
+            # message, no traceback
+            print(f"leku: {ex}", file=sys.stderr)
             sys.exit(1)
 
 
