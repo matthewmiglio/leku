@@ -212,6 +212,14 @@ def resolve_stream(tid, season=None, episode=None):
     if not m:
         raise RuntimeError("player page has no window.CONFIG")
     cfg = json.loads(m.group(1))
+    if not cfg.get("apiToken"):
+        # Gated page: provider serves "cold" (older/less popular) files behind
+        # a Cloudflare Turnstile captcha; a browser must solve it to mint a
+        # real apiToken. See HAS_GATE / refreshGateTicket() in player.js.
+        raise RuntimeError(
+            "this episode is behind a Turnstile captcha gate (a 'cold' file) "
+            "-- open the embed URL in a browser to watch it, or try another "
+            "provider from `stream` output")
     api_token = cfg["apiToken"]
 
     # 4. metadata -> pool host

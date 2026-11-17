@@ -114,6 +114,10 @@ is reported and the loop continues, exiting non-zero if anything failed.
   embed.vidsrc.si funnel into the same backend); the other providers are
   listed by `stream` as alternates.
 - yt-dlp alone cannot crack the embed pages — the resolver is the essential part.
+- **Some content is captcha-gated.** The provider serves "cold" (older/less
+  popular) files behind a Cloudflare Turnstile challenge; those episodes fail
+  with a clear "Turnstile captcha gate" message (a browser solves it for
+  normal viewing — this CLI doesn't). Hot/recent content is ungated.
 - Tokens are single-use and IP-bound, so `download` resolves a fresh chain
   every run (per episode for batch downloads).
 - This tool drives the same public endpoints the site's own player drives,
