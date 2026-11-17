@@ -15,8 +15,10 @@ Usage:
   python leku.py search "the office" --type tv
   python leku.py stream 155                 # movie embed URLs (open in browser)
   python leku.py stream 1399 -s 1 -e 1     # tv episode embed URLs
-  python leku.py download 155               # resolve + download to ./downloads
-  python leku.py download 1399 -s 1 -e 1
+  python leku.py download 155               # movie -> ./downloads
+  python leku.py download 1399 -s 1 -e 1    # single tv episode
+  python leku.py download 1399 -s 1         # whole season
+  python leku.py download 1399              # every episode of the show
   python leku.py download 155 --fragments 20  # sample: first 20 segments only
 
 Requires: node (wasm stream-url decryption), yt-dlp (HLS download).
@@ -78,6 +80,27 @@ def _get(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.load(r)
+
+
+def _tv_season_map(tid):
+    """[(season_number, episode_count)] for every real season (TMDB)."""
+    q = urllib.parse.urlencode({"api_key": TMDB_KEY})
+    data = _get(f"{TMDB}/tv/{tid}?{q}")
+    return [(s["season_number"], s.get("episode_count") or 0)
+            for s in data.get("seasons", [])
+            if (s.get("season_number") or 0) >= 1]
+
+
+def _is_tv(tid):
+    """True if the TMDB id is a TV show (used when no -s/-e is given)."""
+    q = urllib.parse.urlencode({"api_key": TMDB_KEY})
+    try:
+        _get(f"{TMDB}/tv/{tid}?{q}")
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
 
 
 def search(query, mtype="multi"):
@@ -244,7 +267,8 @@ def download(tid, season, episode, out="downloads", fragments=None):
         lines = kept + ["#EXT-X-ENDLIST"]
     body = "\n".join(lines) + "\n"
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title).strip(" .") or f"tmdb_{tid}"
+    label = f" S{int(season):02d}E{int(episode):02d}" if (season and episode) else ""
+    safe = re.sub(r'[<>:"/\\|?*]', "_", title + label).strip(" .") or f"tmdb_{tid}"
     os.makedirs(out, exist_ok=True)
     local = pathlib.Path(tempfile.mkstemp(suffix=".m3u8", prefix=f"leku_{tid}_")[1])
     local.write_text(body, encoding="utf-8")
@@ -265,6 +289,26 @@ def download(tid, season, episode, out="downloads", fragments=None):
         local.unlink()
     except OSError:
         pass
+    return rc
+
+
+def download_all(tid, season=None, out="downloads", fragments=None):
+    """Download every episode of a show, or of one season. Each episode
+    resolves its own fresh provider chain (tokens are single-use)."""
+    rc = 0
+    for s, n in _tv_season_map(tid):
+        if season is not None and s != season:
+            continue
+        for e in range(1, n + 1):
+            print(f"\n=== S{s:02d}E{e:02d} ({e}/{n}) ===")
+            try:
+                if download(tid, str(s), str(e), out=out,
+                            fragments=fragments) != 0:
+                    rc = 1
+            except Exception as ex:
+                rc = 1
+                print(f"S{s:02d}E{e:02d} failed ({ex}); continuing",
+                      file=sys.stderr)
     return rc
 
 
@@ -289,7 +333,18 @@ def main():
     elif a.cmd == "stream":
         stream(a.tmdb_id, a.season, a.episode)
     elif a.cmd == "download":
-        sys.exit(download(a.tmdb_id, a.season, a.episode, fragments=a.fragments))
+        if a.episode:
+            sys.exit(download(a.tmdb_id, a.season, a.episode,
+                              fragments=a.fragments))
+        if a.season:
+            # -s without -e: whole season
+            sys.exit(download_all(a.tmdb_id, season=int(a.season),
+                                 fragments=a.fragments))
+        if _is_tv(a.tmdb_id):
+            # no -s/-e on a show: every episode of every season
+            sys.exit(download_all(a.tmdb_id, fragments=a.fragments))
+        # no -s/-e on a movie: the movie
+        sys.exit(download(a.tmdb_id, None, None, fragments=a.fragments))
 
 
 if __name__ == "__main__":

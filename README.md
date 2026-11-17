@@ -86,14 +86,23 @@ stream (playable embed URLs — open any in a browser to watch):
   python leku.py stream 1399 -s 1 -e 1        # tv season/episode
 
 download (resolves the chain, then yt-dlp → ./downloads/<title>.mp4):
-  python leku.py download 155
-  python leku.py download 1399 -s 1 -e 1
-  python leku.py download 155 --fragments 20   # sample: first 20 segments only
+  python leku.py download 155                  # movie
+  python leku.py download 1399 -s 1 -e 1      # single tv episode
+  python leku.py download 1399 -s 1            # a whole season
+  python leku.py download 1399                  # every episode of the show
+  python leku.py download 155 --fragments 20    # sample: first 20 segments only
 ```
 
 Workflow: `search` prints `tmdb_id  type  year  title` — feed the id into
 `stream` or `download`. `--fragments N` is handy for quick tests without
 pulling a full movie.
+
+For TV, `download` figures out season/episode counts from TMDB and loops
+them, resolving a **fresh provider chain per episode** (tokens are
+single-use). Episodes save as `<title> S01E01.mp4` etc.; a failed episode
+is reported and the loop continues, exiting non-zero if anything failed.
+A bare `download <id>` checks TMDB: a movie id downloads the movie, a show
+id grabs every episode of every season.
 
 ### Notes & caveats
 
@@ -102,9 +111,10 @@ pulling a full movie.
   listed by `stream` as alternates.
 - yt-dlp alone cannot crack the embed pages — the resolver is the essential part.
 - Tokens are single-use and IP-bound, so `download` resolves a fresh chain
-  every run.
+  every run (per episode for batch downloads).
 - This tool drives the same public endpoints the site's own player drives,
-  for personal use. Respect copyright in what you keep.
+  for personal use. Respect copyright in what you keep — see `legal.md`
+  for the US risk profile.
 
 ## Repo layout
 
