@@ -155,6 +155,27 @@ def stream(tid, season, episode):
 #   9. rewrite segment URLs absolute + token -> local m3u8 -> yt-dlp
 # ---------------------------------------------------------------------------
 
+class GatedError(RuntimeError):
+    """The provider served a captcha-gated player page (no apiToken)."""
+
+    def __init__(self, reason, embed):
+        self.reason = reason
+        self.embed = embed
+        super().__init__(f"captcha-gated (reason: {reason}) for {embed}")
+
+
+def _gate_help(err):
+    """Print the human-friendly captcha recovery instructions."""
+    print(file=sys.stderr)
+    print("You're rate-limited by the stream provider "
+          f"(reason: {err.reason}) -- a captcha is needed to continue.",
+          file=sys.stderr)
+    print("Open this in your browser, solve the captcha, then re-run "
+          "this command:", file=sys.stderr)
+    print(f"  {err.embed}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
 def _fetch(url, referer, as_json=False):
     req = urllib.request.Request(
         url, headers={"User-Agent": UA, "Referer": referer})
@@ -215,17 +236,13 @@ def resolve_stream(tid, season=None, episode=None):
     if not cfg.get("apiToken"):
         # Gated page: no apiToken until a Cloudflare Turnstile captcha is
         # solved (in a real browser). The page states why: "over-cap" means
-        # this IP has resolved too many streams recently and is rate-limited
-        # until the cap decays or a captcha is solved. See HAS_GATE /
-        # refreshGateTicket() in the site's player.js.
-        reason = cfg.get("gateReason") or "unknown"
+        # this IP has resolved too many streams recently; solving the captcha
+        # in a browser clears it. See HAS_GATE / refreshGateTicket() in the
+        # site's player.js.
         embed = f"https://vidsrc.sh/embed/{mtype}/{tid}"
         if is_tv:
             embed += f"/{season}/{episode}"
-        raise RuntimeError(
-            f"captcha-gated (reason: {reason}). This IP has resolved too "
-            f"many streams lately. Open this in a browser, solve the "
-            f"captcha, then re-run the command: {embed}")
+        raise GatedError(cfg.get("gateReason") or "unknown", embed)
     api_token = cfg["apiToken"]
 
     # 4. metadata -> pool host
@@ -336,6 +353,14 @@ def download_all(tid, season=None, out="downloads", fragments=None,
                 if download(tid, str(s), str(e), out=out,
                             fragments=fragments) != 0:
                     rc = 1
+            except GatedError as ex:
+                if ex.reason == "over-cap":
+                    # IP-level: every remaining episode would fail too.
+                    _gate_help(ex)
+                    return 1
+                rc = 1
+                print(f"S{s:02d}E{e:02d} gated ({ex.reason}); continuing",
+                      file=sys.stderr)
             except Exception as ex:
                 rc = 1
                 print(f"S{s:02d}E{e:02d} failed ({ex}); continuing",
@@ -369,20 +394,24 @@ def main():
     elif a.cmd == "stream":
         stream(a.tmdb_id, a.season, a.episode)
     elif a.cmd == "download":
-        if a.episode:
-            # -s and -e given: that tv episode
-            sys.exit(download(a.tmdb_id, a.season, a.episode,
-                              fragments=a.fragments))
-        if a.season:
-            # -s without -e: whole season
-            sys.exit(download_all(a.tmdb_id, season=int(a.season),
-                                 fragments=a.fragments))
-        kind = a.type or _tmdb_kind(a.tmdb_id)
-        if kind == "tv":
-            # bare show id: every episode of every season
-            sys.exit(download_all(a.tmdb_id, fragments=a.fragments))
-        # bare movie id: the movie
-        sys.exit(download(a.tmdb_id, None, None, fragments=a.fragments))
+        try:
+            if a.episode:
+                # -s and -e given: that tv episode
+                sys.exit(download(a.tmdb_id, a.season, a.episode,
+                                  fragments=a.fragments))
+            if a.season:
+                # -s without -e: whole season
+                sys.exit(download_all(a.tmdb_id, season=int(a.season),
+                                      fragments=a.fragments))
+            kind = a.type or _tmdb_kind(a.tmdb_id)
+            if kind == "tv":
+                # bare show id: every episode of every season
+                sys.exit(download_all(a.tmdb_id, fragments=a.fragments))
+            # bare movie id: the movie
+            sys.exit(download(a.tmdb_id, None, None, fragments=a.fragments))
+        except GatedError as ex:
+            _gate_help(ex)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
