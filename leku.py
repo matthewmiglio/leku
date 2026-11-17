@@ -297,7 +297,8 @@ def resolve_stream(tid, season=None, episode=None):
     return origin, jwt, playlists, title, pool
 
 
-def download(tid, season, episode, out="downloads", fragments=None):
+def download(tid, season, episode, out="downloads", fragments=None,
+             on_progress=None):
     origin, jwt, playlists, title, pool = resolve_stream(tid, season, episode)
     pool_origin = f"https://{pool}"
 
@@ -340,7 +341,7 @@ def download(tid, season, episode, out="downloads", fragments=None):
     print(f"segments: {sum(1 for l in lines if not l.startswith('#'))}"
           + (f" (sampled to {fragments})" if fragments else ""))
     print(f"-> yt-dlp -> {out}/{safe}.mp4", file=sys.stderr)
-    rc = subprocess.call([
+    cmd = [
         "yt-dlp", "--no-warnings", "--enable-file-urls", "-N", "4",
         "--user-agent", UA,
         "--add-headers", f"Referer: {origin}/",
@@ -350,7 +351,24 @@ def download(tid, season, episode, out="downloads", fragments=None):
         "--fragment-retries", "15",
         "-o", os.path.join(out, f"{safe}.%(ext)s"),
         local.as_uri(),
-    ])
+    ]
+    if on_progress is None:
+        rc = subprocess.call(cmd)
+    else:
+        # --newline makes yt-dlp emit each progress update on its own line;
+        # parse the percent and hand it to the callback (for a live UI).
+        pct_re = re.compile(r"\[download\]\s+([\d.]+)%")
+        proc = subprocess.Popen(cmd + ["--newline"], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            m = pct_re.search(line)
+            if m:
+                try:
+                    on_progress(float(m.group(1)))
+                except Exception:
+                    pass
+        rc = proc.wait()
     try:
         local.unlink()
     except OSError:
