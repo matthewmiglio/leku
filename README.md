@@ -72,7 +72,38 @@ python leku.py search "batman"   # smoke test — should print titles + TMDB ids
 No config, no `.env`, no keys to supply — the TMDB API key it uses is the
 public one lekuluent.et ships in its own client JS.
 
-## Usage
+## Web GUI
+
+`gui.py` is a local web interface over the same `leku.py` functions — a
+cleaner way to browse and download than the terminal. It uses only the Python
+standard library (no Flask).
+
+```bash
+python gui.py      # -> http://localhost:8596
+```
+
+What it gives you:
+
+- **Search** movies & TV with poster thumbnails, and add results to a **watch
+  list**.
+- **Download** from the watch list with a **live progress bar** (yt-dlp's real
+  percent). Downloads run **one at a time** through a single queue — parallel
+  pulls trip the provider's captcha gate.
+- **TV shows** get a **View episodes** sub-page: download the whole show,
+  a single season, or individual episodes; already-downloaded episodes are
+  skipped, so it doubles as resume.
+- **Persistent status** across restarts: finished titles show **Downloaded**,
+  and a title the provider doesn't have shows **failed** with a **Retry**
+  button. State lives in `gui_data.json`; each finished file also gets a
+  `<name>.mp4.leku.json` sidecar (TMDB id + poster) so the browser can show
+  cover art even after you move the folder.
+- **Files on disk** lists only completed `.mp4`s with their posters.
+- **Settings** lets you pick any **downloads folder** (paste a full path).
+
+All the provider resolution, captcha handling, and yt-dlp pacing is the same
+code the CLI uses; the GUI just drives it.
+
+## CLI usage
 
 ```
 usage: leku.py {search,stream,download} ...
@@ -129,6 +160,7 @@ is reported and the loop continues, exiting non-zero if anything failed.
 
 ```
 leku.py      # everything: search / stream / download + embedded wasm decryptor
+gui.py       # local web UI over leku.py (http://localhost:8596)
 README.md
-.gitignore   # ignores downloads/ output
+.gitignore   # ignores downloads/ output and gui_data.json (local GUI state)
 ```
