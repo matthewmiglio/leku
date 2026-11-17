@@ -8,7 +8,8 @@ gui_data.json next to this file. Downloads run one-at-a-time through a single
 background worker (parallel pulls trip the provider's captcha gate); yt-dlp's
 live percent is parsed back for the progress bars.
 """
-import json, os, pathlib, queue, threading, traceback
+import json, logging, os, pathlib, queue, subprocess, threading, time, traceback
+from logging.handlers import RotatingFileHandler
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -16,8 +17,22 @@ import leku
 
 HERE = pathlib.Path(__file__).parent
 STATE = HERE / "gui_data.json"
+LOGDIR = HERE / "logs"
 PORT = 8596
 IMG = "https://image.tmdb.org/t/p/w342"   # same CDN/size the CLI search uses
+
+LOGDIR.mkdir(exist_ok=True)
+log = logging.getLogger("leku.gui")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(threadName)s %(message)s")
+    _fh = RotatingFileHandler(LOGDIR / "gui.log", maxBytes=2_000_000,
+                              backupCount=5, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    log.addHandler(_fh)
+    log.addHandler(_sh)
 
 _lock = threading.Lock()
 JOBS = {}          # jid -> {id, key, label, status, pct, msg}
@@ -94,6 +109,60 @@ def _mp4s(folder):
         return set()
 
 
+def _fmt_dur(sec):
+    sec = int(sec)
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def duration_str(path, side):
+    """mm:ss / h:mm:ss for an mp4 via ffprobe, cached into its sidecar so we
+    probe each file only once. Returns None if ffprobe isn't available."""
+    meta = {}
+    if side.exists():
+        try:
+            meta = json.loads(side.read_text("utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+    if meta.get("duration"):
+        return meta["duration"]
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nk=1:nw=1", str(path)],
+            capture_output=True, text=True, timeout=30)
+        ds = _fmt_dur(float(out.stdout.strip()))
+    except Exception:
+        return None
+    if side.exists():
+        meta["duration"] = ds
+        try:
+            side.write_text(json.dumps(meta), "utf-8")
+        except OSError:
+            pass
+    return ds
+
+
+def disk_movie_ids(folder):
+    """{tmdb_id: filename} for every completed movie on disk (read from the
+    .leku.json sidecars). Disk is the source of truth for 'downloaded'."""
+    out = {}
+    try:
+        for f in pathlib.Path(folder).glob("*.mp4"):
+            side = f.with_name(f.name + ".leku.json")
+            if not side.exists():
+                continue
+            try:
+                meta = json.loads(side.read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            if meta.get("type") == "movie" and meta.get("id") is not None:
+                out[meta["id"]] = f.name
+    except OSError:
+        pass
+    return out
+
+
 def _process(jid):
     job, pay = JOBS[jid], PAY[jid]
     item, s, e, folder = pay["item"], pay["season"], pay["episode"], pay["folder"]
@@ -103,11 +172,17 @@ def _process(jid):
         with _lock:
             job.update(k)
 
+    _bucket = [0]
+
     def prog(p):
         with _lock:
             job.update(status="running", pct=p)
+        if p >= _bucket[0] + 25:           # log every ~25%
+            _bucket[0] = p - (p % 25)
+            log.info("job %s %s: %.0f%%", jid, key, p)
 
     try:
+        log.info("job %s start: %s (key=%s folder=%s)", jid, job["label"], key, folder)
         setj(status="running", pct=0, msg="")
         before = _mp4s(folder)
         if item["type"] == "tv":
@@ -128,19 +203,29 @@ def _process(jid):
         if rc == 0:
             set_status(key, state="downloaded", file=fname, msg="")
             setj(status="done", pct=100)
+            log.info("job %s done: %s -> %s", jid, key, fname)
         else:
             setj(status="failed", msg="yt-dlp returned nonzero (see terminal)")
+            log.warning("job %s failed: %s (yt-dlp rc=%s)", jid, key, rc)
     except leku.GatedError as ex:
-        setj(status="failed", msg=f"captcha-gated ({ex.reason}); open {ex.embed} "
-                                  "in a browser, solve it, then retry")
+        setj(status="failed",
+             msg=f"captcha-gated ({ex.reason}); open {ex.embed} in a browser, "
+                 "solve it, then retry",
+             gate={"reason": ex.reason, "embed": ex.embed})
+        log.warning("job %s gated: %s (%s)", jid, key, ex.reason)
     except RuntimeError as ex:
         setj(status="failed", msg=str(ex))
         if "status 404" in str(ex) or "doesn't have this title" in str(ex):
             # genuinely missing from the library: remember it across restarts
             set_status(key, state="failed_missing", msg=str(ex))
+        log.warning("job %s failed: %s (%s)", jid, key, ex)
     except Exception as ex:
         traceback.print_exc()
         setj(status="failed", msg=str(ex))     # transient: not persisted
+        log.exception("job %s crashed: %s", jid, key)
+
+
+PACE_SECONDS = 60      # wait between sequential downloads to dodge the IP cap
 
 
 def _worker():
@@ -152,6 +237,9 @@ def _worker():
             traceback.print_exc()
         finally:
             Q.task_done()
+        if not Q.empty():
+            log.info("pacing: %ss before next download", PACE_SECONDS)
+            time.sleep(PACE_SECONDS)
 
 
 def enqueue(item, units, folder):
@@ -168,6 +256,7 @@ def enqueue(item, units, folder):
             PAY[jid] = {"item": item, "season": s, "episode": e, "folder": folder}
         Q.put(jid)
         ids.append(jid)
+    log.info("enqueued %d job(s) for %s: %s", len(ids), item.get("title"), ids)
     return ids
 
 
@@ -183,10 +272,57 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        lvl = logging.WARNING if code >= 400 else logging.INFO
+        log.log(lvl, "%s %s -> %s", self.command, self.path, code)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or "{}")
+
+    def _video(self, folder, name):
+        """Stream an mp4 from the downloads folder, honoring Range requests so
+        the player can seek. Rejects anything outside the folder."""
+        try:
+            base = pathlib.Path(folder).resolve()
+            rp = (base / name).resolve()
+            if rp.parent != base or rp.suffix != ".mp4" or not rp.is_file():
+                return self._send(404, {"error": "not found"})
+        except OSError:
+            return self._send(404, {"error": "not found"})
+        size = rp.stat().st_size
+        start, end, status = 0, size - 1, 200
+        rng = self.headers.get("Range")
+        if rng and rng.startswith("bytes="):
+            try:
+                a, b = rng[6:].split("-")
+                start = int(a) if a else 0
+                end = int(b) if b else size - 1
+                status = 206
+            except ValueError:
+                pass
+        end = min(end, size - 1)
+        length = max(0, end - start + 1)
+        self.send_response(status)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(rp, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionError):
+                    break
+                remaining -= len(chunk)
 
     def log_message(self, *a):
         pass
@@ -198,6 +334,8 @@ class H(BaseHTTPRequestHandler):
         folder = s["folder"]
         if p == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
+        if p == "/video":
+            return self._video(folder, qs.get("name", [""])[0])
         if p == "/api/search":
             try:
                 return self._send(200, search(qs.get("q", [""])[0],
@@ -206,6 +344,7 @@ class H(BaseHTTPRequestHandler):
                 return self._send(502, {"error": str(ex)})
         if p == "/api/watchlist":
             out = []
+            dmids = disk_movie_ids(folder)     # id -> filename, from sidecars
             for x in s["watchlist"]:
                 y = dict(x)
                 if x["type"] == "tv":
@@ -214,6 +353,12 @@ class H(BaseHTTPRequestHandler):
                         if k.startswith(f"tv:{x['id']}:")
                         and st_verified(folder, v)
                         and v.get("state") == "downloaded")
+                elif x["id"] in dmids:
+                    # file is on disk: that wins over any stale failed status/job
+                    y["status"] = {"state": "downloaded", "file": dmids[x["id"]]}
+                    key = f"movie:{x['id']}"
+                    if s["status"].get(key, {}).get("state") != "downloaded":
+                        set_status(key, state="downloaded", file=dmids[x["id"]], msg="")
                 else:
                     y["status"] = st_verified(folder,
                                               s["status"].get(f"movie:{x['id']}"))
@@ -235,7 +380,15 @@ class H(BaseHTTPRequestHandler):
             except Exception as ex:
                 return self._send(502, {"error": str(ex)})
         if p == "/api/settings":
-            return self._send(200, {"folder": folder})
+            n, nbytes = 0, 0
+            try:
+                for f in pathlib.Path(folder).glob("*.mp4"):
+                    n += 1
+                    nbytes += f.stat().st_size
+            except OSError:
+                pass
+            return self._send(200, {"folder": folder, "count": n,
+                                    "gb": round(nbytes / 1e9, 2)})
         if p == "/api/jobs":
             with _lock:
                 return self._send(200, list(JOBS.values()))
@@ -247,7 +400,7 @@ class H(BaseHTTPRequestHandler):
                         continue
                     rec = {"name": f.name,
                            "mb": round(f.stat().st_size / 1e6, 1),
-                           "poster": "", "id": None, "type": None}
+                           "poster": "", "id": None, "type": None, "dur": None}
                     side = f.with_name(f.name + ".leku.json")
                     if side.exists():
                         try:
@@ -255,6 +408,7 @@ class H(BaseHTTPRequestHandler):
                             rec["name"] = f.name
                         except (OSError, ValueError):
                             pass
+                    rec["dur"] = duration_str(f, side)
                     files.append(rec)
                 files.sort(key=lambda x: x["name"])
             except OSError:
@@ -310,7 +464,11 @@ color:var(--fg)}button.red{background:var(--bad);border:0;color:#fff}
 button:disabled{opacity:.7;cursor:default}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-overflow:hidden;display:flex;flex-direction:column}
+overflow:hidden;display:flex;flex-direction:column;position:relative}
+.trash{position:absolute;bottom:10px;right:10px;width:30px;height:30px;border:0;
+border-radius:8px;background:rgba(0,0,0,.55);color:var(--bad);cursor:pointer;
+display:flex;align-items:center;justify-content:center;padding:0}
+.trash:hover{background:var(--bad);color:#fff}
 .card img{width:100%;aspect-ratio:2/3;object-fit:cover;background:#000;display:block}
 .card .p{padding:10px;display:flex;flex-direction:column;flex:1}
 .card .t{font-weight:600;font-size:14px}
@@ -331,13 +489,21 @@ padding:8px 12px;margin-bottom:6px;display:flex;justify-content:space-between}
 .ep .grow{flex:1}.ep button{padding:6px 12px}
 .seas{margin:18px 0}.seas h3{margin:0 0 6px;display:flex;justify-content:space-between;align-items:center}
 .msg{font-size:12px;margin-top:4px}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;
+align-items:center;justify-content:center;z-index:99}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:22px;max-width:440px;width:90%}
+.modal h2{margin:0 0 6px;font-size:18px}.modal p{color:var(--mut);margin:8px 0}
+.modal .btns{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
+.modal a{color:var(--acc);word-break:break-all}
 </style></head><body>
 <header><b>leku</b><nav id=nav></nav></header>
 <main id=main></main>
+<div id=modal></div>
 <script>
 const $=s=>document.querySelector(s),el=h=>{const d=document.createElement('div');d.innerHTML=h;return d.firstElementChild}
-const TABS=['Search','Watch list','Files on disk','Settings']
-let tab='Search', showEps=null, poll=null
+const TABS=['Search','Wishlist','My movies','Watch','Settings']
+let tab='Search', showEps=null, poll=null, playing=null
 const api=(u,m,b)=>fetch(u,m?{method:m,headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{}).then(r=>r.json())
 const esc=s=>(s||'').replace(/"/g,'&quot;')
 
@@ -347,9 +513,11 @@ function startPoll(fn){stopPoll();poll=setInterval(fn,1500)}
 
 async function render(){nav();stopPoll();const m=$('#main');m.innerHTML='loading…'
  if(tab=='Search')return renderSearch(m)
- if(tab=='Watch list')return showEps?renderEps(m):renderWatch(m)
- if(tab=='Files on disk')return renderFiles(m)
+ if(tab=='Wishlist')return showEps?renderEps(m):renderWishlist(m)
+ if(tab=='My movies')return renderFiles(m)
+ if(tab=='Watch')return renderPlay(m)
  if(tab=='Settings')return renderSettings(m)}
+function watchMovie(name){playing=name;tab='Watch';showEps=null;render()}
 
 function posterTag(x){return x.poster?`<img src="${x.poster}">`:`<img alt="">`}
 
@@ -380,13 +548,15 @@ function movieAction(x,job){
  if(job&&(job.status=='queued'||job.status=='running'))return barHtml(job)
  const st=x.status&&x.status.state
  if(st=='downloaded')return `<button class="b" style="background:var(--ok)" disabled>Downloaded ✓</button>`
- if(st=='failed_missing')return `<div class=msg><span class=bad>failed — ${x.status.msg||'not in library'}</span></div><button class="b red dl">Retry</button>`
- if(job&&job.status=='failed')return `<div class=msg><span class=bad>failed — ${job.msg||''}</span></div><button class="b red dl">Retry</button>`
+ if(st=='failed_missing')return `<div class="msg bad" title="${esc(x.status.msg||'')}">failed</div><button class="b red dl">Retry</button>`
+ if(job&&job.status=='failed')return `<div class="msg bad" title="${esc(job.msg||'')}">failed</div><button class="b red dl">Retry</button>`
  return `<button class="b dl">Download</button>`}
 
-async function renderWatch(m){
- const [w,jobs]=await Promise.all([api('/api/watchlist'),api('/api/jobs')])
- if(!w.length){m.innerHTML='<div class=empty>Watch list is empty. Add things from Search.</div>';return}
+async function renderWishlist(m){
+ let [w,jobs]=await Promise.all([api('/api/watchlist'),api('/api/jobs')])
+ // hide movies already fully downloaded — they live on "My movies" now
+ w=w.filter(x=>!(x.type!='tv'&&x.status&&x.status.state=='downloaded'))
+ if(!w.length){m.innerHTML='<div class=empty>Wishlist is empty. Add things from Search.</div>';return}
  const jk=jobsByKey(jobs)
  m.innerHTML='<div class=grid id=g></div>'
  w.forEach(x=>{
@@ -396,16 +566,17 @@ async function renderWatch(m){
   else act=movieAction(x,jk['movie:'+x.id])
   const c=el(`<div class=card>${posterTag(x)}<div class=p>
    <div class=t>${x.title}</div><div class=m><span class=tag>${x.type}</span> ${x.year||''}</div>
-   <div class=act>${act}<button class="g rm">Remove</button></div></div></div>`)
+   <div class=act>${act}</div></div>
+   <button class="trash rm" title="Remove from wishlist"><svg viewBox="0 0 24 24" width=16 height=16 fill=currentColor><path d="M9 3v1H4v2h16V4h-5V3H9zM6 8l1 12h10l1-12H6z"/></svg></button></div>`)
   const dl=c.querySelector('.dl')
-  if(dl)dl.onclick=async()=>{await api('/api/enqueue','POST',{item:x,units:[{}]});renderWatch(m)}
+  if(dl)dl.onclick=async()=>{await api('/api/enqueue','POST',{item:x,units:[{}]});renderWishlist(m)}
   const eps=c.querySelector('.eps')
   if(eps)eps.onclick=()=>{showEps=x;renderEps(m)}
-  c.querySelector('.rm').onclick=async()=>{await api('/api/watchlist/remove','POST',x);renderWatch(m)}
+  c.querySelector('.rm').onclick=async()=>{await api('/api/watchlist/remove','POST',x);renderWishlist(m)}
   $('#g').append(c)})
  // live refresh while anything is active
  if(jobs.some(j=>j.status=='queued'||j.status=='running'))
-  startPoll(()=>{if(tab=='Watch list'&&!showEps)renderWatch(m)})}
+  startPoll(()=>{if(tab=='Wishlist'&&!showEps)renderWishlist(m)})}
 
 // ---- Episodes sub-page
 async function renderEps(m){const x=showEps
@@ -413,7 +584,7 @@ async function renderEps(m){const x=showEps
   <b style="font-size:17px">${x.title}</b><span class=mut>${x.year||''}</span>
   <button class="b" id=all style="margin-left:auto">Download all missing</button></div>
   <div id=body>loading episodes…</div>`
- $('#back').onclick=()=>{showEps=null;renderWatch(m)}
+ $('#back').onclick=()=>{showEps=null;renderWishlist(m)}
  const [r,jobs]=await Promise.all([api('/api/episodes?id='+x.id),api('/api/jobs')])
  if(r.error){$('#body').innerHTML='<div class=empty>'+r.error+'</div>';return}
  const jk=jobsByKey(jobs)
@@ -444,21 +615,63 @@ async function renderEps(m){const x=showEps
  if(jobs.some(j=>j.status=='queued'||j.status=='running'))
   startPoll(()=>{if(showEps)renderEps(m)})}
 
-// ---- Files on disk
+// ---- My movies (completed files on disk)
 async function renderFiles(m){const r=await api('/api/downloaded')
  let h=`<div class="row mut">Folder: ${r.folder}</div>`
  if(!r.files.length){m.innerHTML=h+'<div class=empty>Nothing downloaded here yet.</div>';return}
- h+='<div class=grid>'+r.files.map(f=>`<div class=card>${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
+ h+='<div class=grid id=g></div>'
+ m.innerHTML=h
+ r.files.forEach(f=>{const c=el(`<div class=card>${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
   <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div>
-  <div class=m>${f.type?`<span class=tag>${f.type}</span> `:''}${f.mb} MB</div></div></div>`).join('')+'</div>'
- m.innerHTML=h}
+  <div class=m>${f.type?`<span class=tag>${f.type}</span> `:''}${f.dur||f.mb+' MB'}</div>
+  <div class=act><button class="b watch">Watch</button></div></div></div>`)
+  c.querySelector('.watch').onclick=()=>watchMovie(f.name)
+  $('#g').append(c)})}
+
+// ---- Watch (video player + your other movies)
+async function renderPlay(m){const r=await api('/api/downloaded')
+ if(!r.files.length){m.innerHTML='<div class=empty>No downloaded movies to watch yet.</div>';return}
+ if(!playing||!r.files.some(f=>f.name==playing))playing=r.files[0].name
+ const cur=r.files.find(f=>f.name==playing),others=r.files.filter(f=>f.name!=playing)
+ m.innerHTML=`<h2 style="margin:0 0 10px">${cur.name.replace(/\.mp4$/,'')}</h2>
+  <video id=vid src="/video?name=${encodeURIComponent(playing)}" controls autoplay playsinline
+   style="width:100%;max-height:72vh;background:#000;border-radius:12px;display:block"></video>
+  ${others.length?`<h3 style="margin:20px 0 8px">Your other movies</h3><div class=grid id=others></div>`:''}`
+ const g=$('#others');if(!g)return
+ others.forEach(f=>{const c=el(`<div class=card style="cursor:pointer">${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
+  <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div><div class=m>${f.dur||f.mb+' MB'}</div></div></div>`)
+  c.onclick=()=>{playing=f.name;renderPlay(m);window.scrollTo(0,0)}
+  g.append(c)})}
 
 // ---- Settings
 async function renderSettings(m){const r=await api('/api/settings')
  m.innerHTML=`<div class=row><input id=f value="${esc(r.folder)}">
   <button class=b id=sv>Save</button></div>
-  <div class=mut>Paste the full path downloads should go to (e.g. D:\\Movies). Created if missing.</div>`
+  <div class=mut>${r.count} file${r.count==1?'':'s'} · ${r.gb} GB on disk</div>
+  <div class=mut style="margin-top:6px">Paste the full path downloads should go to (e.g. D:\\Movies). Created if missing.</div>`
  $('#sv').onclick=async()=>{const r=await api('/api/settings','POST',{folder:$('#f').value});$('#f').value=r.folder;$('#sv').textContent='Saved ✓';setTimeout(()=>$('#sv').textContent='Save',1500)}}
+
+// ---- captcha gate modal (page-wide). Shows once; closing suppresses every
+// gate seen so far, so it only returns for a NEWER job (a fresh Download click).
+let gateFloor=0, lastJobId=0, modalOpen=false
+function closeModal(){modalOpen=false;gateFloor=lastJobId;$('#modal').innerHTML=''}
+function gateModal(g){modalOpen=true
+ const o=el(`<div class=overlay><div class=modal>
+  <h2>⚠ Captcha triggered</h2>
+  <p>You triggered the provider's captcha by downloading too fast.</p>
+  <p>Either take a break and let it cool off, or solve the captcha here:</p>
+  <p><a href="${g.embed}" target=_blank rel=noopener>${g.embed}</a></p>
+  <div class=btns><button class="g cancel">Close</button><button class="b solve">Solve</button></div>
+  </div></div>`)
+ o.querySelector('.solve').onclick=()=>{window.open(g.embed,'_blank','noopener');closeModal()}
+ o.querySelector('.cancel').onclick=closeModal
+ o.onclick=e=>{if(e.target==o)closeModal()}
+ $('#modal').innerHTML='';$('#modal').append(o)}
+async function gateCheck(){if(modalOpen||tab!='Wishlist')return;try{const jobs=await api('/api/jobs')
+ jobs.forEach(j=>{if(j.id>lastJobId)lastJobId=j.id})
+ const g=jobs.find(j=>j.gate&&j.id>gateFloor)
+ if(g)gateModal(g.gate)}catch(e){}}
+setInterval(gateCheck,2500)
 
 render()
 </script></body></html>"""
@@ -468,5 +681,6 @@ if __name__ == "__main__":
     threading.Thread(target=_worker, daemon=True).start()
     folder = load_state()["folder"]
     os.makedirs(folder, exist_ok=True)
+    log.info("server start: http://localhost:%s (downloads: %s)", PORT, folder)
     print(f"leku gui -> http://localhost:{PORT}  (downloads: {folder})")
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
