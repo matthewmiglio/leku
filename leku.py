@@ -219,10 +219,13 @@ def resolve_stream(tid, season=None, episode=None):
         # until the cap decays or a captcha is solved. See HAS_GATE /
         # refreshGateTicket() in the site's player.js.
         reason = cfg.get("gateReason") or "unknown"
+        embed = f"https://vidsrc.sh/embed/{mtype}/{tid}"
+        if is_tv:
+            embed += f"/{season}/{episode}"
         raise RuntimeError(
-            f"captcha-gated (reason: {reason}). If 'over-cap', this IP has "
-            "resolved too many streams lately -- wait a while and retry, or "
-            "open the embed URL in a browser and solve the captcha")
+            f"captcha-gated (reason: {reason}). This IP has resolved too "
+            f"many streams lately. Open this in a browser, solve the "
+            f"captcha, then re-run the command: {embed}")
     api_token = cfg["apiToken"]
 
     # 4. metadata -> pool host
