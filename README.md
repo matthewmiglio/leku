@@ -10,15 +10,19 @@ for playback. `leku.py` reproduces what the site's own player does, including
 resolving the vidsrc provider chain (signed tokens, encrypted stream URLs,
 WASM decryption) end to end.
 
+![leku web GUI — Files on disk](_images/files_on_disk.png)
+
 ## How it works
 
 ```mermaid
 flowchart TD
+    GUI["python gui.py<br/>(web UI on :8596)"]
     subgraph CLI["python leku.py"]
         S["search &lt;query&gt;"]
         T["stream &lt;tmdb_id&gt;"]
         D["download &lt;tmdb_id&gt;"]
     end
+    GUI -->|"drives the same search / download functions"| CLI
 
     S -->|"GET /3/search (embedded public key)"| TMDB["TMDB api.themoviedb.org"]
     T -->|"URL templates from site JS"| EMB["Embed providers<br/>(vidsrc.sh, vidlink.pro,<br/>vidfast.vc, vidrock.to, vidsrc.si)"]
