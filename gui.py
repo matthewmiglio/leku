@@ -40,6 +40,9 @@ PAY = {}           # jid -> {item, season, episode, folder}
 Q = queue.Queue()
 _seq = [0]
 
+BLOCK_MINUTES = 30
+BLOCK_UNTIL = [0.0]   # epoch: after a captcha gate, hold all downloads till here
+
 
 # --- persistent state -------------------------------------------------------
 
@@ -200,19 +203,30 @@ def _process(jid):
                     json.dumps(meta), "utf-8")
             except OSError:
                 pass
-        if rc == 0:
+        # Disk is the source of truth: yt-dlp can exit nonzero AFTER a complete
+        # file (a trailing segment 403 / fixup warning once the mp4 is already
+        # muxed). A new final .mp4 means done, whatever rc says. ponytail: a
+        # genuinely failed pull leaves only .part, so `new` stays empty -> failed.
+        if rc == 0 or fname:
             set_status(key, state="downloaded", file=fname, msg="")
             setj(status="done", pct=100)
-            log.info("job %s done: %s -> %s", jid, key, fname)
+            log.info("job %s done: %s -> %s%s", jid, key, fname,
+                     "" if rc == 0 else f" (yt-dlp rc={rc}, file complete)")
         else:
             setj(status="failed", msg="yt-dlp returned nonzero (see terminal)")
             log.warning("job %s failed: %s (yt-dlp rc=%s)", jid, key, rc)
     except leku.GatedError as ex:
-        setj(status="failed",
-             msg=f"captcha-gated ({ex.reason}); open {ex.embed} in a browser, "
-                 "solve it, then retry",
+        # Captcha gate => the provider is rate-capping this IP. Self-block all
+        # downloads for BLOCK_MINUTES so we stop retrying (each retry just resets
+        # the provider's timer). Requeue this unit; the worker auto-resumes it
+        # once the cooldown passes.
+        BLOCK_UNTIL[0] = time.time() + BLOCK_MINUTES * 60
+        setj(status="blocked", pct=0,
+             msg=f"captcha gate ({ex.reason}); downloads paused {BLOCK_MINUTES} min",
              gate={"reason": ex.reason, "embed": ex.embed})
-        log.warning("job %s gated: %s (%s)", jid, key, ex.reason)
+        Q.put(jid)
+        log.warning("job %s gated: %s (%s) -- self-blocking %dm",
+                    jid, key, ex.reason, BLOCK_MINUTES)
     except RuntimeError as ex:
         setj(status="failed", msg=str(ex))
         if "status 404" in str(ex) or "doesn't have this title" in str(ex):
@@ -225,19 +239,29 @@ def _process(jid):
         log.exception("job %s crashed: %s", jid, key)
 
 
-PACE_SECONDS = 60      # wait between sequential downloads to dodge the IP cap
+PACE_SECONDS = 120     # wait between sequential downloads to dodge the IP cap
 
 
 def _worker():
     while True:
         jid = Q.get()
         try:
+            wait = BLOCK_UNTIL[0] - time.time()
+            if wait > 0:
+                # Cooling down after a captcha: hold this job, don't touch leku.
+                until = time.strftime("%H:%M", time.localtime(BLOCK_UNTIL[0]))
+                with _lock:
+                    JOBS[jid].update(status="blocked", pct=0,
+                                     msg=f"paused after captcha; resumes ~{until}")
+                Q.put(jid)                 # retry after cooldown
+                time.sleep(min(wait, 15))  # recheck; new jobs wait here too
+                continue
             _process(jid)
         except Exception:
             traceback.print_exc()
         finally:
             Q.task_done()
-        if not Q.empty():
+        if not Q.empty() and BLOCK_UNTIL[0] <= time.time():
             log.info("pacing: %ss before next download", PACE_SECONDS)
             time.sleep(PACE_SECONDS)
 
@@ -392,6 +416,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/jobs":
             with _lock:
                 return self._send(200, list(JOBS.values()))
+        if p == "/api/gate":
+            now = time.time()
+            left = max(0, int(BLOCK_UNTIL[0] - now))
+            return self._send(200, {"blocked": left > 0, "secondsLeft": left,
+                                    "minutes": BLOCK_MINUTES})
         if p == "/api/downloaded":
             files = []
             try:
@@ -496,6 +525,8 @@ padding:22px;max-width:440px;width:90%}
 .modal h2{margin:0 0 6px;font-size:18px}.modal p{color:var(--mut);margin:8px 0}
 .modal .btns{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
 .modal a{color:var(--acc);word-break:break-all}
+.cooldown{background:rgba(255,107,107,.12);border:1px solid var(--bad);color:var(--fg);
+border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:14px}
 </style></head><body>
 <header><b>leku</b><nav id=nav></nav></header>
 <main id=main></main>
@@ -541,11 +572,17 @@ function renderSearch(m){
 
 // ---- Watch list (movies: inline download + progress; tv: view episodes)
 function jobsByKey(jobs){const m={};jobs.forEach(j=>{if(!m[j.key]||j.id>m[j.key].id)m[j.key]=j});return m}
-function barHtml(j){const p=j.status=='queued'?0:j.pct||0
- return `<div class=bar><i style="width:${p}%"></i><span>${j.status=='queued'?'queued…':p.toFixed(0)+'%'}</span></div>`}
+function barHtml(j){const held=j.status=='queued'||j.status=='blocked',p=held?0:j.pct||0
+ const lbl=j.status=='queued'?'queued…':j.status=='blocked'?'paused — cooling down':p.toFixed(0)+'%'
+ return `<div class=bar><i style="width:${p}%"></i><span>${lbl}</span></div>`}
+
+// cooldown state (set by gateCheck polling /api/gate)
+let blockLeft=0
+const blocked=()=>blockLeft>0
+function fmtLeft(){const s=Math.max(0,blockLeft);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
 
 function movieAction(x,job){
- if(job&&(job.status=='queued'||job.status=='running'))return barHtml(job)
+ if(job&&(job.status=='queued'||job.status=='running'||job.status=='blocked'))return barHtml(job)
  const st=x.status&&x.status.state
  if(st=='downloaded')return `<button class="b" style="background:var(--ok)" disabled>Downloaded ✓</button>`
  if(st=='failed_missing')return `<div class="msg bad" title="${esc(x.status.msg||'')}">failed</div><button class="b red dl">Retry</button>`
@@ -558,7 +595,8 @@ async function renderWishlist(m){
  w=w.filter(x=>!(x.type!='tv'&&x.status&&x.status.state=='downloaded'))
  if(!w.length){m.innerHTML='<div class=empty>Wishlist is empty. Add things from Search.</div>';return}
  const jk=jobsByKey(jobs)
- m.innerHTML='<div class=grid id=g></div>'
+ const banner=blocked()?`<div class=cooldown>⏸ <b>Downloads paused</b> after a captcha — resuming in <b>${fmtLeft()}</b>. We stopped retrying so the provider's rate-block can expire; queued items resume automatically.</div>`:''
+ m.innerHTML=banner+'<div class=grid id=g></div>'
  w.forEach(x=>{
   let act
   if(x.type=='tv'){act=`<button class="b eps">View episodes</button>`
@@ -569,51 +607,63 @@ async function renderWishlist(m){
    <div class=act>${act}</div></div>
    <button class="trash rm" title="Remove from wishlist"><svg viewBox="0 0 24 24" width=16 height=16 fill=currentColor><path d="M9 3v1H4v2h16V4h-5V3H9zM6 8l1 12h10l1-12H6z"/></svg></button></div>`)
   const dl=c.querySelector('.dl')
-  if(dl)dl.onclick=async()=>{await api('/api/enqueue','POST',{item:x,units:[{}]});renderWishlist(m)}
+  if(dl){if(blocked()){dl.disabled=true;dl.textContent='Paused ⏸'}
+   else dl.onclick=async()=>{await api('/api/enqueue','POST',{item:x,units:[{}]});renderWishlist(m)}}
   const eps=c.querySelector('.eps')
   if(eps)eps.onclick=()=>{showEps=x;renderEps(m)}
   c.querySelector('.rm').onclick=async()=>{await api('/api/watchlist/remove','POST',x);renderWishlist(m)}
   $('#g').append(c)})
- // live refresh while anything is active
- if(jobs.some(j=>j.status=='queued'||j.status=='running'))
+ // live refresh while anything is active or we're cooling down (countdown ticks)
+ if(blocked()||jobs.some(j=>j.status=='queued'||j.status=='running'||j.status=='blocked'))
   startPoll(()=>{if(tab=='Wishlist'&&!showEps)renderWishlist(m)})}
 
-// ---- Episodes sub-page
+// ---- Episodes sub-page.
+// Episode list (TMDB) is fetched ONCE; polling only patches the per-episode
+// bars from /api/jobs — no full re-render, no flashing "loading episodes…".
+function epAction(x,se,ep,job){
+ if(job&&(job.status=='queued'||job.status=='running'||job.status=='blocked'))return barHtml(job)
+ if(ep.state=='downloaded'||(job&&job.status=='done'))return `<span class=ok>Downloaded ✓</span>`
+ if(ep.state=='failed_missing')return `<span class=bad>missing</span> <button class="b red one" data-s="${se.season}" data-e="${ep.e}">Retry</button>`
+ if(job&&job.status=='failed')return `<span class=bad>failed</span> <button class="b one" data-s="${se.season}" data-e="${ep.e}">Retry</button>`
+ return `<button class="b one" data-s="${se.season}" data-e="${ep.e}">Download</button>`}
+
 async function renderEps(m){const x=showEps
  m.innerHTML=`<div class=row><button class="g" id=back>← Back</button>
   <b style="font-size:17px">${x.title}</b><span class=mut>${x.year||''}</span>
   <button class="b" id=all style="margin-left:auto">Download all missing</button></div>
-  <div id=body>loading episodes…</div>`
+  <div id=cd></div><div id=body>loading episodes…</div>`
  $('#back').onclick=()=>{showEps=null;renderWishlist(m)}
- const [r,jobs]=await Promise.all([api('/api/episodes?id='+x.id),api('/api/jobs')])
+ let [r,jobs]=await Promise.all([api('/api/episodes?id='+x.id),api('/api/jobs')])
+ if(!showEps)return                 // navigated away while loading
  if(r.error){$('#body').innerHTML='<div class=empty>'+r.error+'</div>';return}
- const jk=jobsByKey(jobs)
+ const eps={}  // key -> {se, ep}
+ r.seasons.forEach(se=>se.episodes.forEach(ep=>{eps['tv:'+x.id+':'+se.season+':'+ep.e]={se,ep}}))
  const go=(units)=>api('/api/enqueue','POST',{item:x,units}).then(()=>renderEps(m))
- const missing=[]
- r.seasons.forEach(se=>se.episodes.forEach(ep=>{if(ep.state!='downloaded')missing.push({season:String(se.season),episode:String(ep.e)})}))
- $('#all').onclick=()=>go(missing)
- if(!missing.length)$('#all').textContent='All downloaded ✓',$('#all').disabled=true
- let h=''
+ const missing=()=>Object.values(eps).filter(o=>o.ep.state!='downloaded').map(o=>({season:String(o.se.season),episode:String(o.ep.e)}))
+ $('#all').onclick=()=>go(missing())
+ if(!missing().length)$('#all').textContent='All downloaded ✓',$('#all').disabled=true
+ let jk=jobsByKey(jobs), h=''
  r.seasons.forEach(se=>{
-  const sm=se.episodes.filter(ep=>ep.state!='downloaded').map(ep=>({season:String(se.season),episode:String(ep.e)}))
+  const sm=se.episodes.filter(ep=>ep.state!='downloaded').length
   h+=`<div class=seas><h3><span>Season ${se.season} <span class=mut>(${se.episodes.length} ep)</span></span>
-   <button class="g sall" data-s="${se.season}" ${sm.length?'':'disabled'}>Download season</button></h3>`
-  se.episodes.forEach(ep=>{
-   const key='tv:'+x.id+':'+se.season+':'+ep.e, job=jk[key]
-   let a
-   if(job&&(job.status=='queued'||job.status=='running'))a=barHtml(job)
-   else if(ep.state=='downloaded')a=`<span class=ok>Downloaded ✓</span>`
-   else if(ep.state=='failed_missing')a=`<span class=bad>missing</span> <button class="b red one" data-s="${se.season}" data-e="${ep.e}">Retry</button>`
-   else if(job&&job.status=='failed')a=`<span class=bad>failed</span> <button class="b one" data-s="${se.season}" data-e="${ep.e}">Retry</button>`
-   else a=`<button class="b one" data-s="${se.season}" data-e="${ep.e}">Download</button>`
-   h+=`<div class=ep><span class=lbl>S${String(se.season).padStart(2,'0')}E${String(ep.e).padStart(2,'0')}</span><span class="grow bararea">${a}</span></div>`})
+   <button class="g sall" data-s="${se.season}" ${sm?'':'disabled'}>Download season</button></h3>`
+  se.episodes.forEach(ep=>{const key='tv:'+x.id+':'+se.season+':'+ep.e
+   h+=`<div class=ep><span class=lbl>S${String(se.season).padStart(2,'0')}E${String(ep.e).padStart(2,'0')}</span><span class="grow bararea" data-k="${key}">${epAction(x,se,ep,jk[key])}</span></div>`})
   h+='</div>'})
  $('#body').innerHTML=h
- $('#body').querySelectorAll('.one').forEach(b=>b.onclick=()=>go([{season:b.dataset.s,episode:b.dataset.e}]))
- $('#body').querySelectorAll('.sall').forEach(b=>b.onclick=()=>{
-  const u=[];r.seasons.find(s=>String(s.season)==b.dataset.s).episodes.forEach(ep=>{if(ep.state!='downloaded')u.push({season:b.dataset.s,episode:String(ep.e)})});go(u)})
- if(jobs.some(j=>j.status=='queued'||j.status=='running'))
-  startPoll(()=>{if(showEps)renderEps(m)})}
+ // one delegated handler — survives bar patching (buttons get re-created on poll)
+ $('#body').onclick=e=>{const b=e.target.closest('.one,.sall');if(!b||b.disabled)return
+  if(b.classList.contains('one'))go([{season:b.dataset.s,episode:b.dataset.e}])
+  else go(Object.values(eps).filter(o=>String(o.se.season)==b.dataset.s&&o.ep.state!='downloaded').map(o=>({season:b.dataset.s,episode:String(o.ep.e)})))}
+ const paint=()=>{
+  $('#cd').innerHTML=blocked()?`<div class=cooldown>⏸ <b>Downloads paused</b> after a captcha — resuming in <b id=cdleft>${fmtLeft()}</b>. Queued episodes resume automatically.</div>`:''
+  $('#body').querySelectorAll('.bararea').forEach(sp=>{const o=eps[sp.dataset.k];if(o)sp.innerHTML=epAction(x,o.se,o.ep,jk[sp.dataset.k])})
+  m.querySelectorAll('#all,.one,.sall').forEach(b=>{if(blocked())b.disabled=true})}
+ paint()
+ const active=()=>jobs.some(x=>x.status=='queued'||x.status=='running'||x.status=='blocked')
+ if(blocked()||active())startPoll(async()=>{if(!showEps)return stopPoll()
+  jobs=await api('/api/jobs');jk=jobsByKey(jobs);paint()
+  if(!blocked()&&!active())stopPoll()})}
 
 // ---- My movies (completed files on disk)
 async function renderFiles(m){const r=await api('/api/downloaded')
@@ -658,8 +708,10 @@ function closeModal(){modalOpen=false;gateFloor=lastJobId;$('#modal').innerHTML=
 function gateModal(g){modalOpen=true
  const o=el(`<div class=overlay><div class=modal>
   <h2>⚠ Captcha triggered</h2>
-  <p>You triggered the provider's captcha by downloading too fast.</p>
-  <p>Either take a break and let it cool off, or solve the captcha here:</p>
+  <p>You triggered the provider's captcha by downloading too fast. Downloads
+     are <b>paused for ${g.minutes||30} minutes</b> so we stop retrying — retrying
+     just resets the provider's block. Queued items resume automatically.</p>
+  <p>Want to watch now anyway? Solve the captcha in your browser:</p>
   <p><a href="${g.embed}" target=_blank rel=noopener>${g.embed}</a></p>
   <div class=btns><button class="g cancel">Close</button><button class="b solve">Solve</button></div>
   </div></div>`)
@@ -672,6 +724,8 @@ async function gateCheck(){if(modalOpen||tab!='Wishlist')return;try{const jobs=a
  const g=jobs.find(j=>j.gate&&j.id>gateFloor)
  if(g)gateModal(g.gate)}catch(e){}}
 setInterval(gateCheck,2500)
+async function pollGate(){try{const g=await api('/api/gate');blockLeft=g.secondsLeft||0}catch(e){}}
+setInterval(pollGate,1000);pollGate()
 
 render()
 </script></body></html>"""
