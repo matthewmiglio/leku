@@ -527,6 +527,14 @@ padding:22px;max-width:440px;width:90%}
 .modal a{color:var(--acc);word-break:break-all}
 .cooldown{background:rgba(255,107,107,.12);border:1px solid var(--bad);color:var(--fg);
 border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:14px}
+.subtabs{display:flex;gap:4px;margin:22px 0 10px}
+.subtabs button{background:var(--card);border:1px solid var(--line);color:var(--mut);
+padding:7px 16px;border-radius:8px;cursor:pointer;font:inherit}
+.subtabs button.on{color:var(--fg);border-color:var(--acc)}
+.epr{display:flex;align-items:center;gap:10px;padding:10px 12px;margin-bottom:6px;cursor:pointer;
+background:var(--card);border:1px solid var(--line);border-radius:8px}
+.epr:hover{border-color:var(--acc)}.epr.on{border-color:var(--acc);background:#232733}
+.epr .lbl{font-variant-numeric:tabular-nums;font-weight:600;width:72px}.epr .grow{flex:1}
 </style></head><body>
 <header><b>leku</b><nav id=nav></nav></header>
 <main id=main></main>
@@ -534,7 +542,7 @@ border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:14px}
 <script>
 const $=s=>document.querySelector(s),el=h=>{const d=document.createElement('div');d.innerHTML=h;return d.firstElementChild}
 const TABS=['Search','Wishlist','My movies','Watch','Settings']
-let tab='Search', showEps=null, poll=null, playing=null
+let tab='Search', showEps=null, poll=null, playing=null, playTab='movies', openShow=null
 const api=(u,m,b)=>fetch(u,m?{method:m,headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{}).then(r=>r.json())
 const esc=s=>(s||'').replace(/"/g,'&quot;')
 
@@ -548,7 +556,7 @@ async function render(){nav();stopPoll();const m=$('#main');m.innerHTML='loading
  if(tab=='My movies')return renderFiles(m)
  if(tab=='Watch')return renderPlay(m)
  if(tab=='Settings')return renderSettings(m)}
-function watchMovie(name){playing=name;tab='Watch';showEps=null;render()}
+function watchMovie(name){playing=name;tab='Watch';showEps=null;openShow=null;playTab=/S\d+E\d+/i.test(name)?'tv':'movies';render()}
 
 function posterTag(x){return x.poster?`<img src="${x.poster}">`:`<img alt="">`}
 
@@ -678,20 +686,59 @@ async function renderFiles(m){const r=await api('/api/downloaded')
   c.querySelector('.watch').onclick=()=>watchMovie(f.name)
   $('#g').append(c)})}
 
-// ---- Watch (video player + your other movies)
+// ---- Watch (video player; Movies / TV-shows sub-tabs below it)
+const isTvFile=f=>f.type=='tv'||/S\d+E\d+/i.test(f.name)
+function epLabel(name){const mo=name.match(/S(\d+)E(\d+)/i)
+ return mo?'S'+mo[1].padStart(2,'0')+'E'+mo[2].padStart(2,'0'):name.replace(/\.mp4$/,'')}
+
 async function renderPlay(m){const r=await api('/api/downloaded')
- if(!r.files.length){m.innerHTML='<div class=empty>No downloaded movies to watch yet.</div>';return}
+ if(!r.files.length){m.innerHTML='<div class=empty>Nothing downloaded to watch yet.</div>';return}
+ const movies=r.files.filter(f=>!isTvFile(f)), tv=r.files.filter(isTvFile)
+ const shows={}   // key -> {title, poster, eps:[...]}
+ tv.forEach(f=>{const k=String(f.id||f.title||f.name)
+  const mo=f.name.match(/S(\d+)E(\d+)/i), s=mo?+mo[1]:0, e=mo?+mo[2]:0
+  ;(shows[k]=shows[k]||{title:f.title||f.name.replace(/\.mp4$/,''),poster:f.poster,eps:[]})
+   .eps.push({...f,s,e,lbl:epLabel(f.name)})})
+ Object.values(shows).forEach(sh=>sh.eps.sort((a,b)=>a.s-b.s||a.e-b.e))
  if(!playing||!r.files.some(f=>f.name==playing))playing=r.files[0].name
- const cur=r.files.find(f=>f.name==playing),others=r.files.filter(f=>f.name!=playing)
- m.innerHTML=`<h2 style="margin:0 0 10px">${cur.name.replace(/\.mp4$/,'')}</h2>
+ const cur=r.files.find(f=>f.name==playing)
+ // arriving on a tv episode: open its show automatically
+ if(isTvFile(cur)&&playTab=='tv'&&openShow==null)openShow=String(cur.id||cur.title||cur.name)
+ const head=isTvFile(cur)?`${cur.title||''} <span class=mut>${epLabel(cur.name)}</span>`:cur.name.replace(/\.mp4$/,'')
+ m.innerHTML=`<h2 style="margin:0 0 10px">${head}</h2>
   <video id=vid src="/video?name=${encodeURIComponent(playing)}" controls autoplay playsinline
    style="width:100%;max-height:72vh;background:#000;border-radius:12px;display:block"></video>
-  ${others.length?`<h3 style="margin:20px 0 8px">Your other movies</h3><div class=grid id=others></div>`:''}`
- const g=$('#others');if(!g)return
- others.forEach(f=>{const c=el(`<div class=card style="cursor:pointer">${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
-  <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div><div class=m>${f.dur||f.mb+' MB'}</div></div></div>`)
-  c.onclick=()=>{playing=f.name;renderPlay(m);window.scrollTo(0,0)}
-  g.append(c)})}
+  <div class=subtabs>
+   <button data-t=movies class="${playTab=='movies'?'on':''}">Movies (${movies.length})</button>
+   <button data-t=tv class="${playTab=='tv'?'on':''}">TV shows (${Object.keys(shows).length})</button>
+  </div><div id=list></div>`
+ m.querySelectorAll('.subtabs button').forEach(b=>b.onclick=()=>{playTab=b.dataset.t;openShow=null;renderPlay(m)})
+ const list=$('#list'), play=name=>{playing=name;renderPlay(m);window.scrollTo(0,0)}
+ if(playTab=='movies'){
+  if(!movies.length){list.innerHTML='<div class=empty>No movies downloaded yet.</div>';return}
+  list.innerHTML='<div class=grid id=g></div>'
+  movies.forEach(f=>{const c=el(`<div class=card style="cursor:pointer;${f.name==playing?'border-color:var(--acc)':''}">${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
+   <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div><div class=m>${f.dur||f.mb+' MB'}</div></div></div>`)
+   c.onclick=()=>play(f.name);$('#g').append(c)})
+ }else{
+  const keys=Object.keys(shows)
+  if(!keys.length){list.innerHTML='<div class=empty>No TV shows downloaded yet.</div>';return}
+  if(openShow!=null&&shows[openShow]){const sh=shows[openShow]
+   list.innerHTML=`<button class="g" id=back style="margin-bottom:12px">← All shows</button>
+    <h3 style="margin:0 0 10px">${sh.title} <span class=mut>(${sh.eps.length} ep)</span></h3><div id=eps></div>`
+   $('#back').onclick=()=>{openShow=null;renderPlay(m)}
+   sh.eps.forEach(ep=>{const row=el(`<div class="epr${ep.name==playing?' on':''}">
+    <span class=lbl>${ep.lbl}</span><span class="grow mut">${ep.dur||ep.mb+' MB'}</span>
+    <span class="${ep.name==playing?'ok':'mut'}">${ep.name==playing?'▶ playing':'play'}</span></div>`)
+    row.onclick=()=>play(ep.name);$('#eps').append(row)})
+  }else{
+   list.innerHTML='<div class=grid id=g></div>'
+   keys.forEach(k=>{const sh=shows[k]
+    const c=el(`<div class=card style="cursor:pointer">${sh.poster?`<img src="${sh.poster}">`:`<img alt="">`}
+     <div class=p><div class=t>${sh.title}</div><div class=m>${sh.eps.length} episode${sh.eps.length==1?'':'s'}</div></div></div>`)
+    c.onclick=()=>{openShow=k;renderPlay(m)};$('#g').append(c)})
+  }
+ }}
 
 // ---- Settings
 async function renderSettings(m){const r=await api('/api/settings')
