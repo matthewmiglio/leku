@@ -8,7 +8,7 @@ gui_data.json next to this file. Downloads run one-at-a-time through a single
 background worker (parallel pulls trip the provider's captcha gate); yt-dlp's
 live percent is parsed back for the progress bars.
 """
-import json, logging, os, pathlib, queue, subprocess, threading, time, traceback
+import functools, json, logging, os, pathlib, queue, subprocess, threading, time, traceback
 from logging.handlers import RotatingFileHandler
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -72,6 +72,15 @@ def unit_key(item, season, episode):
     if item["type"] == "tv":
         return f"tv:{item['id']}:{season}:{episode}"
     return f"movie:{item['id']}"
+
+
+@functools.lru_cache(maxsize=None)
+def _ep_total(tid):
+    """Total episode count for a show (TMDB), cached. 0 if lookup fails."""
+    try:
+        return sum(n for _, n in leku._tv_season_map(str(tid)))
+    except Exception:
+        return 0
 
 
 def st_verified(folder, st):
@@ -239,7 +248,7 @@ def _process(jid):
         log.exception("job %s crashed: %s", jid, key)
 
 
-PACE_SECONDS = 120     # wait between sequential downloads to dodge the IP cap
+PACE_SECONDS = 240     # wait between sequential downloads to dodge the IP cap
 
 
 def _worker():
@@ -377,6 +386,7 @@ class H(BaseHTTPRequestHandler):
                         if k.startswith(f"tv:{x['id']}:")
                         and st_verified(folder, v)
                         and v.get("state") == "downloaded")
+                    y["eptotal"] = _ep_total(x["id"])
                 elif x["id"] in dmids:
                     # file is on disk: that wins over any stale failed status/job
                     y["status"] = {"state": "downloaded", "file": dmids[x["id"]]}
@@ -489,7 +499,8 @@ input,select{background:var(--card);border:1px solid var(--line);color:var(--fg)
 padding:9px 11px;border-radius:8px;font:inherit}input{flex:1;min-width:180px}
 button.b{background:var(--acc);border:0;color:#fff;padding:9px 16px;border-radius:8px;
 cursor:pointer;font:inherit}button.g{background:var(--card);border:1px solid var(--line);
-color:var(--fg)}button.red{background:var(--bad);border:0;color:#fff}
+color:var(--fg);padding:9px 16px;border-radius:8px;cursor:pointer;font:inherit}
+button.red{background:var(--bad);border:0;color:#fff}
 button:disabled{opacity:.7;cursor:default}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
@@ -599,8 +610,10 @@ function movieAction(x,job){
 
 async function renderWishlist(m){
  let [w,jobs]=await Promise.all([api('/api/watchlist'),api('/api/jobs')])
- // hide movies already fully downloaded — they live on "My movies" now
- w=w.filter(x=>!(x.type!='tv'&&x.status&&x.status.state=='downloaded'))
+ // hide anything fully downloaded — movies and complete TV shows live on "My movies" now
+ w=w.filter(x=>x.type=='tv'
+  ? !(x.eptotal&&x.dlcount>=x.eptotal)
+  : !(x.status&&x.status.state=='downloaded'))
  if(!w.length){m.innerHTML='<div class=empty>Wishlist is empty. Add things from Search.</div>';return}
  const jk=jobsByKey(jobs)
  const banner=blocked()?`<div class=cooldown>⏸ <b>Downloads paused</b> after a captcha — resuming in <b>${fmtLeft()}</b>. We stopped retrying so the provider's rate-block can expire; queued items resume automatically.</div>`:''
@@ -679,11 +692,22 @@ async function renderFiles(m){const r=await api('/api/downloaded')
  if(!r.files.length){m.innerHTML=h+'<div class=empty>Nothing downloaded here yet.</div>';return}
  h+='<div class=grid id=g></div>'
  m.innerHTML=h
- r.files.forEach(f=>{const c=el(`<div class=card>${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
+ const movies=r.files.filter(f=>!isTvFile(f)), tv=r.files.filter(isTvFile)
+ const shows={}   // key -> {title, poster, eps:[...]}
+ tv.forEach(f=>{const k=String(f.id||f.title||f.name)
+  ;(shows[k]=shows[k]||{title:f.title||f.name.replace(/\.mp4$/,''),poster:f.poster,eps:[]}).eps.push(f)})
+ movies.forEach(f=>{const c=el(`<div class=card>${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
   <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div>
-  <div class=m>${f.type?`<span class=tag>${f.type}</span> `:''}${f.dur||f.mb+' MB'}</div>
+  <div class=m><span class=tag>movie</span> ${f.dur||f.mb+' MB'}</div>
   <div class=act><button class="b watch">Watch</button></div></div></div>`)
   c.querySelector('.watch').onclick=()=>watchMovie(f.name)
+  $('#g').append(c)})
+ Object.keys(shows).forEach(k=>{const sh=shows[k]
+  const c=el(`<div class=card>${sh.poster?`<img src="${sh.poster}">`:`<img alt="">`}
+  <div class=p><div class=t>${sh.title}</div>
+  <div class=m><span class=tag>tv</span> ${sh.eps.length} episode${sh.eps.length==1?'':'s'}</div>
+  <div class=act><button class="b watch">Watch</button></div></div></div>`)
+  c.querySelector('.watch').onclick=()=>{playTab='tv';openShow=k;playing=sh.eps[0].name;tab='Watch';render()}
   $('#g').append(c)})}
 
 // ---- Watch (video player; Movies / TV-shows sub-tabs below it)
