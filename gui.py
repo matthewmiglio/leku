@@ -8,7 +8,7 @@ gui_data.json next to this file. Downloads run one-at-a-time through a single
 background worker (parallel pulls trip the provider's captcha gate); yt-dlp's
 live percent is parsed back for the progress bars.
 """
-import functools, json, logging, os, pathlib, queue, subprocess, threading, time, traceback
+import functools, json, logging, os, pathlib, queue, socket, subprocess, threading, time, traceback
 from logging.handlers import RotatingFileHandler
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -54,6 +54,7 @@ def load_state():
     s.setdefault("watchlist", [])
     s.setdefault("folder", str(HERE / "downloads"))
     s.setdefault("status", {})     # key -> {state, msg, file}
+    s.setdefault("progress", {})   # file name -> {pos, dur, done}
     return s
 
 
@@ -448,6 +449,9 @@ class H(BaseHTTPRequestHandler):
                         except (OSError, ValueError):
                             pass
                     rec["dur"] = duration_str(f, side)
+                    pr = s["progress"].get(f.name) or {}
+                    rec["pos"] = pr.get("pos", 0)
+                    rec["done"] = bool(pr.get("done"))
                     files.append(rec)
                 files.sort(key=lambda x: x["name"])
             except OSError:
@@ -476,6 +480,20 @@ class H(BaseHTTPRequestHandler):
             save_state(s)
             os.makedirs(s["folder"], exist_ok=True)
             return self._send(200, {"folder": s["folder"]})
+        if p == "/api/progress":
+            name = d.get("name")
+            if name:
+                with _lock:
+                    s = load_state()
+                    pr = s["progress"].get(name, {})
+                    pr["pos"] = int(d.get("pos") or 0)
+                    if d.get("dur"):
+                        pr["dur"] = int(d["dur"])
+                    if d.get("done"):
+                        pr["done"] = True
+                    s["progress"][name] = pr
+                    save_state(s)
+            return self._send(200, {"ok": True})
         if p == "/api/enqueue":
             ids = enqueue(d["item"], d.get("units") or [{}], s["folder"])
             return self._send(200, {"ids": ids})
@@ -553,7 +571,7 @@ background:var(--card);border:1px solid var(--line);border-radius:8px}
 <script>
 const $=s=>document.querySelector(s),el=h=>{const d=document.createElement('div');d.innerHTML=h;return d.firstElementChild}
 const TABS=['Search','Wishlist','My movies','Watch','Settings']
-let tab='Search', showEps=null, poll=null, playing=null, playTab='movies', openShow=null
+let tab='Search', showEps=null, poll=null, playing=null, playTab='movies', openShow=null, resumeSeek=0
 const api=(u,m,b)=>fetch(u,m?{method:m,headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{}).then(r=>r.json())
 const esc=s=>(s||'').replace(/"/g,'&quot;')
 
@@ -714,6 +732,20 @@ async function renderFiles(m){const r=await api('/api/downloaded')
 const isTvFile=f=>f.type=='tv'||/S\d+E\d+/i.test(f.name)
 function epLabel(name){const mo=name.match(/S(\d+)E(\d+)/i)
  return mo?'S'+mo[1].padStart(2,'0')+'E'+mo[2].padStart(2,'0'):name.replace(/\.mp4$/,'')}
+function hms(s){s=Math.floor(s||0);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60
+ return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')}
+// resume target: in-progress ep (pos>0, not done) latest in order, else next unwatched, else ep1
+function resumeTarget(sh){let ip=null;sh.eps.forEach(e=>{if(e.pos>0&&!e.done)ip=e})
+ if(ip)return{ep:ip,pos:ip.pos};const nd=sh.eps.find(e=>!e.done);return nd?{ep:nd,pos:0}:{ep:sh.eps[0],pos:0}}
+let _lastSave=0
+function saveProg(name,pos,dur,done){api('/api/progress','POST',{name,pos:Math.floor(pos||0),dur:Math.floor(dur||0),done:!!done})}
+function wireVideo(vid){
+ try{const v=localStorage.getItem('vol');if(v!=null)vid.volume=+v;const mu=localStorage.getItem('muted');if(mu!=null)vid.muted=mu=='1'}catch(e){}
+ vid.onvolumechange=()=>{try{localStorage.setItem('vol',vid.volume);localStorage.setItem('muted',vid.muted?'1':'0')}catch(e){}}
+ vid.onloadedmetadata=()=>{if(resumeSeek>0)vid.currentTime=Math.min(resumeSeek,(vid.duration||1e9)-1);resumeSeek=0}
+ vid.ontimeupdate=()=>{const n=Date.now();if(n-_lastSave<5000)return;_lastSave=n;saveProg(playing,vid.currentTime,vid.duration,false)}
+ vid.onpause=()=>saveProg(playing,vid.currentTime,vid.duration,false)
+ vid.onended=()=>saveProg(playing,vid.duration,vid.duration,true)}
 
 async function renderPlay(m){const r=await api('/api/downloaded')
  if(!r.files.length){m.innerHTML='<div class=empty>Nothing downloaded to watch yet.</div>';return}
@@ -736,30 +768,37 @@ async function renderPlay(m){const r=await api('/api/downloaded')
    <button data-t=movies class="${playTab=='movies'?'on':''}">Movies (${movies.length})</button>
    <button data-t=tv class="${playTab=='tv'?'on':''}">TV shows (${Object.keys(shows).length})</button>
   </div><div id=list></div>`
+ wireVideo($('#vid'))
  m.querySelectorAll('.subtabs button').forEach(b=>b.onclick=()=>{playTab=b.dataset.t;openShow=null;renderPlay(m)})
- const list=$('#list'), play=name=>{playing=name;renderPlay(m);window.scrollTo(0,0)}
+ const list=$('#list'), play=(name,seek)=>{resumeSeek=seek||0;playing=name;renderPlay(m);window.scrollTo(0,0)}
  if(playTab=='movies'){
   if(!movies.length){list.innerHTML='<div class=empty>No movies downloaded yet.</div>';return}
   list.innerHTML='<div class=grid id=g></div>'
   movies.forEach(f=>{const c=el(`<div class=card style="cursor:pointer;${f.name==playing?'border-color:var(--acc)':''}">${f.poster?`<img src="${f.poster}">`:`<img alt="">`}
-   <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div><div class=m>${f.dur||f.mb+' MB'}</div></div></div>`)
-   c.onclick=()=>play(f.name);$('#g').append(c)})
+   <div class=p><div class=t>${f.name.replace(/\.mp4$/,'')}</div><div class=m>${f.dur||f.mb+' MB'}${f.pos>0&&!f.done?` · <span class=ok>resume ${hms(f.pos)}</span>`:''}</div></div></div>`)
+   c.onclick=()=>play(f.name,f.pos>0&&!f.done?f.pos:0);$('#g').append(c)})
  }else{
   const keys=Object.keys(shows)
   if(!keys.length){list.innerHTML='<div class=empty>No TV shows downloaded yet.</div>';return}
   if(openShow!=null&&shows[openShow]){const sh=shows[openShow]
+   const t=resumeTarget(sh)
    list.innerHTML=`<button class="g" id=back style="margin-bottom:12px">← All shows</button>
-    <h3 style="margin:0 0 10px">${sh.title} <span class=mut>(${sh.eps.length} ep)</span></h3><div id=eps></div>`
+    <div class=row style="align-items:center"><h3 style="margin:0">${sh.title} <span class=mut>(${sh.eps.length} ep)</span></h3>
+    <button class="b" id=resume style="margin-left:auto">▶ Resume ${t.ep.lbl}${t.pos>0?` @ ${hms(t.pos)}`:''}</button></div>
+    <div id=eps></div>`
    $('#back').onclick=()=>{openShow=null;renderPlay(m)}
-   sh.eps.forEach(ep=>{const row=el(`<div class="epr${ep.name==playing?' on':''}">
+   $('#resume').onclick=()=>play(t.ep.name,t.pos)
+   sh.eps.forEach(ep=>{const tag=ep.done?'<span class=ok>watched ✓</span>'
+    :ep.pos>0?`<span class=ok>resume ${hms(ep.pos)}</span>`:'<span class=mut>play</span>'
+    const row=el(`<div class="epr${ep.name==playing?' on':''}">
     <span class=lbl>${ep.lbl}</span><span class="grow mut">${ep.dur||ep.mb+' MB'}</span>
-    <span class="${ep.name==playing?'ok':'mut'}">${ep.name==playing?'▶ playing':'play'}</span></div>`)
-    row.onclick=()=>play(ep.name);$('#eps').append(row)})
+    ${ep.name==playing?'<span class=ok>▶ playing</span>':tag}</div>`)
+    row.onclick=()=>play(ep.name,ep.pos>0&&!ep.done?ep.pos:0);$('#eps').append(row)})
   }else{
    list.innerHTML='<div class=grid id=g></div>'
-   keys.forEach(k=>{const sh=shows[k]
+   keys.forEach(k=>{const sh=shows[k],wd=sh.eps.filter(e=>e.done).length
     const c=el(`<div class=card style="cursor:pointer">${sh.poster?`<img src="${sh.poster}">`:`<img alt="">`}
-     <div class=p><div class=t>${sh.title}</div><div class=m>${sh.eps.length} episode${sh.eps.length==1?'':'s'}</div></div></div>`)
+     <div class=p><div class=t>${sh.title}</div><div class=m>${sh.eps.length} episode${sh.eps.length==1?'':'s'}${wd?` · <span class=ok>${wd} watched</span>`:''}</div></div></div>`)
     c.onclick=()=>{openShow=k;renderPlay(m)};$('#g').append(c)})
   }
  }}
@@ -806,6 +845,12 @@ if __name__ == "__main__":
     threading.Thread(target=_worker, daemon=True).start()
     folder = load_state()["folder"]
     os.makedirs(folder, exist_ok=True)
+    host = socket.gethostname()
+    try:
+        lan = socket.gethostbyname(host)
+    except OSError:
+        lan = "<this-pc-ip>"
     log.info("server start: http://localhost:%s (downloads: %s)", PORT, folder)
     print(f"leku gui -> http://localhost:{PORT}  (downloads: {folder})")
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    print(f"           on your phone: http://{host}.local:{PORT}   (or http://{lan}:{PORT})")
+    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
